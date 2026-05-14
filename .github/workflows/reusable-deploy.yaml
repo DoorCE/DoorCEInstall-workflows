@@ -1,0 +1,339 @@
+on:
+  workflow_call:
+    inputs:
+      action:
+        type: string
+        default: 'plan'
+      reason:
+        type: string
+        default: 'Manual trigger'
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    env:
+      TG_PROVIDER_CACHE: 1
+      TG_PROVIDER_CACHE_DIR: ${{ github.workspace }}/.tg_provider_cache
+      TG_PARALLELISM: 6
+      TG_LOG_LEVEL: info
+      TG_DEPENDENCY_FETCH_OUTPUT_FROM_STATE: true
+      
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      SSH_PUBLIC_KEY: ${{ vars.SSH_PUBLIC_KEY }}
+      INCUS_TOKEN: ${{ secrets.INCUS_TOKEN }}
+      INCUS_ADDRESS: ${{ vars.INCUS_ADDRESS }}
+      INCUS_NAME: ${{ vars.INCUS_NAME }}
+      TFE_HOSTNAME: ${{ vars.TFE_HOSTNAME }}
+      TFE_ORGANIZATION: ${{ vars.TFE_ORGANIZATION }}
+      TFE_TOKEN: ${{ secrets.TFE_TOKEN }}
+      TFE_PASSPHRASE: ${{ secrets.TFE_PASSPHRASE }}
+      TRAEFIK_KEY: ${{ secrets.TRAEFIK_KEY }}
+      TRAEFIK_CERT: ${{ secrets.TRAEFIK_CERT }}
+      DOORCE_EXTERNAL_URL: ${{ vars.DOORCE_EXTERNAL_URL }}
+      DOORCE_EXTERNAL_IP: ${{ vars.DOORCE_EXTERNAL_IP }}
+      
+    steps:
+
+      - name: Safety Check for Destroy Action
+        run: |
+          ACTION="${{ inputs.action }}"
+          REASON="${{ inputs.reason }}"
+          REQUIRED_CONFIRMATION="Yes, I am 100% sure I want to destroy this service and I understand the consequences"
+
+          echo "Selected Action: $ACTION"
+
+          if [ "$ACTION" == "destroy" ]; then
+            if [ "$REASON" != "$REQUIRED_CONFIRMATION" ]; then
+              echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+              echo "CRITICAL ERROR: Destroy action requested without proper confirmation!"
+              echo "Expected: '$REQUIRED_CONFIRMATION'"
+              echo "Received: '$REASON'"
+              echo "Execution aborted to prevent accidental data loss."
+              echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+              exit 1
+            else
+              echo "Confirmation accepted. Proceeding with infrastructure destruction..."
+            fi
+          fi
+
+      - name: Configure SSH to use port 443
+        run: |
+          mkdir -p ~/.ssh
+          echo "Host github.com
+            Hostname ssh.github.com
+            # Port 22 is often blocked, so we use 443 as an alternative
+            Port 443
+            User git" > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+      - name: Add GitHub host keys if not present
+        run: |
+          mkdir -p ~/.ssh
+          touch ~/.ssh/known_hosts
+          
+          K1="github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+          K2="ssh.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+          K3="[ssh.github.com]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+
+          grep -qxF "$K1" ~/.ssh/known_hosts || echo "$K1" >> ~/.ssh/known_hosts
+          grep -qxF "$K2" ~/.ssh/known_hosts || echo "$K2" >> ~/.ssh/known_hosts
+          grep -qxF "$K3" ~/.ssh/known_hosts || echo "$K3" >> ~/.ssh/known_hosts
+          
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Checkout Caller Repo (Config)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          clean: true
+
+      - name: Checkout Infrastructure Library (This repo)
+        uses: actions/checkout@v4
+        with:
+          repository: DoorCE/DoorCEInstall
+          ref: main
+          ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          path: infra-lib
+
+      - name: Set up Terragrunt and OpenTofu
+        uses: gruntwork-io/terragrunt-action@v3
+        with:
+          tg_version: '0.93.3'
+          tofu_version: '1.10.5'
+          
+      - name: Verify versions
+        run: |
+          terragrunt --version
+          tofu version
+
+      - name: 🏗️ Run Terragrunt Stack
+        run: |
+          mkdir -p ${{ env.TG_PROVIDER_CACHE_DIR }}
+
+          mkdir -p infra-lib/stacks/prod/
+          [ -f config.yaml ] && cp config.yaml infra-lib/stacks/prod/ || echo "No config.yaml found in root, skipping copy."
+          cp infra-lib/stacks/template/terragrunt.stack.hcl infra-lib/stacks/prod/
+          cd infra-lib/stacks/prod/
+          terragrunt stack generate
+          cd .terragrunt-stack/.terragrunt-stack/
+          terragrunt dag graph > stack_graph.dot
+          set -o pipefail
+          terragrunt stack run ${{ inputs.action }} --non-interactive 2>&1 | tee deployment.log
+
+      - name: 🚀 Generate Deployment Summary
+        if: always()
+        run: |
+          STATUS="🟢 SUCCESS"
+          [ "${{ job.status }}" != "success" ] && STATUS="🔴 FAILED"
+
+          if command -v fortune >/dev/null 2>&1; then
+            QUOTE=$(fortune -s)
+          else
+            QUOTE="The code is mightier than the sword... usually."
+          fi
+
+          echo "### 🚀 DoorCE Deployment Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Details |" >> $GITHUB_STEP_SUMMARY
+          echo "| :--- | :--- |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | $STATUS |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Action Executed** | \`${{ github.event.inputs.action || 'plan (auto-push)' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment URL** | [ \`$DOORCE_EXTERNAL_URL\` ]($DOORCE_EXTERNAL_URL) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Triggered By** | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -n "${{ github.event.inputs.reason }}" ]; then
+            echo "| **Reason/Confirmation** | ${{ github.event.inputs.reason }} |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### 💡 Server Wisdom" >> $GITHUB_STEP_SUMMARY
+          echo "> *${QUOTE}*" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Generated at: $(date -u)" >> $GITHUB_STEP_SUMMARY
+
+
+      - name: 📊 Generate Deployment Report
+        if: always()
+        run: |
+          LOG_FILE="infra-lib/stacks/prod/.terragrunt-stack/.terragrunt-stack/deployment.log"
+          
+          if [ ! -f "$LOG_FILE" ]; then
+            echo "### 📊 Deployment Summary Report" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ Log file not found at $LOG_FILE" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          echo "### 📊 Deployment Summary Report" >> $GITHUB_STEP_SUMMARY
+          echo "| Unit Name | Action | Imp | Add | Chg | Dst | Unm |" >> $GITHUB_STEP_SUMMARY
+          echo "| :--- | :--- | :---: | :---: | :---: | :---: | :---: |" >> $GITHUB_STEP_SUMMARY
+
+          # Czyścimy kolory ANSI i parsujemy używając awk z rozdzielonymi sumami
+          sed -r "s/\x1B\[[0-9;]*[a-zA-Z]//g" "$LOG_FILE" | \
+          tr -d '\000-\010\013\014\016-\037' | \
+          awk -F'[][]' '
+          BEGIN { 
+              # Liczniki dla Planu
+              p_imp=0; p_add=0; p_chg=0; p_dst=0; p_unm=0;
+              # Liczniki dla Wykonania (Apply/Destroy)
+              a_add=0; a_chg=0; a_dst=0;
+              has_plan=0; has_apply=0;
+          }
+          /tofu: (Plan:|Apply complete!|Destroy complete!)/ {
+              full_unit = $2;
+              n = split(full_unit, path, "/");
+              unit = path[n];
+              line = $0;
+
+              if (line ~ /Plan:/) {
+                  has_plan=1;
+                  imp=0; add=0; chg=0; dst=0; unm=0;
+                  if (match(line, /([0-9]+) to import/))   { m=substr(line, RSTART, RLENGTH); gsub(/[^0-9]/,"",m); imp=m }
+                  if (match(line, /([0-9]+) to add/))      { m=substr(line, RSTART, RLENGTH); gsub(/[^0-9]/,"",m); add=m }
+                  if (match(line, /([0-9]+) to change/))   { m=substr(line, RSTART, RLENGTH); gsub(/[^0-9]/,"",m); chg=m }
+                  if (match(line, /([0-9]+) to destroy/))  { m=substr(line, RSTART, RLENGTH); gsub(/[^0-9]/,"",m); dst=m }
+                  if (match(line, /([0-9]+) no longer managed/)) { m=substr(line, RSTART, RLENGTH); gsub(/[^0-9]/,"",m); unm=m }
+                  
+                  p_imp+=imp; p_add+=add; p_chg+=chg; p_dst+=dst; p_unm+=unm;
+                  printf("| `%s` | 📝 Planned | %s | %s | %s | %s | %s |\n", full_unit, imp, add, chg, dst, unm);
+              }
+              else {
+                  has_apply=1;
+                  add=0; chg=0; dst=0;
+                  action = (line ~ /Apply/) ? "✅ Applied" : "🔥 Destroyed";
+                  if (match(line, /([0-9]+) added/))     { m=substr(line, RSTART, RLENGTH); gsub(/[^0-9]/,"",m); add=m }
+                  if (match(line, /([0-9]+) changed/))   { m=substr(line, RSTART, RLENGTH); gsub(/[^0-9]/,"",m); chg=m }
+                  if (match(line, /([0-9]+) destroyed/)) { m=substr(line, RSTART, RLENGTH); gsub(/[^0-9]/,"",m); dst=m }
+                  
+                  a_add+=add; a_chg+=chg; a_dst+=dst;
+                  printf("| `%s` | %s | - | %s | %s | %s | - |\n", full_unit, action, add, chg, dst);
+              }
+          }
+          END {
+              if (has_plan) {
+                  printf("| **TOTAL PLAN** | | **%d** | **%d** | **%d** | **%d** | **%d** |\n", p_imp, p_add, p_chg, p_dst, p_unm);
+              }
+              if (has_apply) {
+                  printf("| **TOTAL EXEC** | | - | **%d** | **%d** | **%d** | - |\n", a_add, a_chg, a_dst);
+              }
+          }' >> $GITHUB_STEP_SUMMARY
+
+      - name: 🧩 Generate Infrastructure Diagram
+        if: always()
+        run: |
+          DOT_FILE="infra-lib/stacks/prod/.terragrunt-stack/.terragrunt-stack/stack_graph.dot"
+          
+          if [ -f "$DOT_FILE" ]; then
+            # Wewnątrz bloku run:
+            case "${{ env.RUN_ACTION }}" in
+              "plan")    STATUS=" - (plan)" ;;
+              "apply")   STATUS=" - (after deploy)" ;;
+              "destroy") STATUS=" - (post-destroy check)" ;;
+              *)         STATUS="" ;;
+            esac
+            echo "### 🧩 Infrastructure Dependency Diagram$STATUS" >> $GITHUB_STEP_SUMMARY
+
+            echo '```mermaid' >> $GITHUB_STEP_SUMMARY
+            
+          sed 's/\.terragrunt-stack\///g; s/\"//g; s/;//g' "$DOT_FILE" \
+          | awk '
+              function get_label(name) {
+                  # Domyślne wartości
+                  icon = "❓"; type_desc = "unknown node"; clean_name = name;
+
+                  # Incus - Kontener systemowy
+                  if (name ~ /incus\/csys/) {
+                      icon = "🐧"; type_desc = "incus -> system container";
+                      sub(/incus\/csys\//, "", clean_name);
+                  }
+                  # Incus - Kontener aplikacyjny
+                  else if (name ~ /incus\/capp/) {
+                      icon = "🐳"; type_desc = "incus -> app. container";
+                      sub(/incus\/capp\//, "", clean_name);
+                  }
+                  # Incus - Maszyna wirtualna
+                  else if (name ~ /incus\/vm/) {
+                      icon = "🖥️"; type_desc = "incus -> virtual machine";
+                      sub(/incus\/vm\//, "", clean_name);
+                  }
+                  # Docker - Kontener aplikacyjny
+                  else if (name ~ /docker\/capp/) {
+                      icon = "🐳"; type_desc = "docker -> app. container";
+                      sub(/docker\/capp\//, "", clean_name);
+                  }
+                  # Docker - Wolumen
+                  else if (name ~ /docker\/vol/) {
+                      icon = "💾"; type_desc = "docker -> volume";
+                      sub(/docker\/vol\//, "", clean_name);
+                  }
+                  # Incus - Sieć
+                  else if (name ~ /incus\/net/) {
+                      icon = "🌐"; type_desc = "incus -> virtual net";
+                      sub(/incus\/net\//, "", clean_name);
+                  }
+                  # Docker - Sieć
+                  else if (name ~ /docker\/net/) {
+                      icon = "🌐"; type_desc = "docker -> virtual net";
+                      sub(/docker\/net\//, "", clean_name);
+                  }
+                  # Fallback dla innych sieci (jeśli istnieją)
+                  else if (name ~ /net/) {
+                      icon = "🔌"; type_desc = "network -> physical net";
+                      sub(/.*\/net\//, "", clean_name);
+                  }
+                  else if (name ~ /config/) {
+                      icon = "⚙️"; type_desc = "config -> stack";
+                      sub(/config\//, "", clean_name);
+                  }
+                  else if (name ~ /incus\/profile/) {
+                      icon = "📑"; type_desc = "incus -> profile";
+                      sub(/incus\/profile\//, "", clean_name);
+                  }
+
+                  # Zwraca sformatowaną etykietę: IKONA NAZWA <br/> TYP
+                  return sprintf("%s %s<br/>%s", icon, clean_name, type_desc);
+              }
+
+              function get_id(name) {
+                  safe_id = name;
+                  gsub(/[\/\.-]/, "_", safe_id);
+                  return safe_id;
+              }
+
+              {
+                  if ($1 == "digraph" || $1 == "}" || $1 == "{" || $1 == "") next;
+                  if ($1 == "." || $1 == ".terragrunt-stack" || $3 == "." || $3 == ".terragrunt-stack") next;
+
+                  if ($2 == "->") {
+                      from_n = $1; to_n = $3;
+                      from_id = get_id(from_n); to_id = get_id(to_n);
+                      nodes[from_n] = from_id;
+                      nodes[to_n] = to_id;
+                      edges[from_id " --> " to_id] = 1;
+                  } else if ($1 != "" && $1 != "}") {
+                      nodes[$1] = get_id($1);
+                  }
+              }
+
+              END {
+                  print "graph TD"
+                  print "  classDef unitNode fill:#2d3436,color:#fff,stroke:#dfe6e9,stroke-width:2px,font-size:12px;"
+                  for (name in nodes) {
+                      if (name == "." || name == ".terragrunt-stack" || name == "") continue;
+                      id = nodes[name];
+                      printf "  %s[\"%s\"]\n", id, get_label(name);
+                      printf "  %s:::unitNode\n", id;
+                  }
+                  for (edge in edges) {
+                      if (edge ~ /^(_|__) -->/ || edge ~ /--> (_|__)$/) continue;
+                      printf "  %s\n", edge;
+                  }
+              }
+          ' >> $GITHUB_STEP_SUMMARY            
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Warning: $DOT_FILE not found. Skipping diagram." >> $GITHUB_STEP_SUMMARY
+          fi

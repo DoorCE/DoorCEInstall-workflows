@@ -1,0 +1,37 @@
+name: Incus Setup
+run-name: >-
+  ${{ 
+    format('{0} ({1}): {2} by @{3}', 
+      (github.event.inputs.environment || 'production'), 
+      (github.event.inputs.action || 'plan'), 
+      (github.event.inputs.reason || github.ref_name), 
+      github.actor
+    ) 
+  }}
+
+on:
+  # push:
+  #   branches:
+  #     - main
+  workflow_call:
+    inputs:
+      action:
+        required: true
+        type: string
+      reason:
+        required: true
+        type: string
+      branch:
+        required: false
+        type: string
+        default: 'main'
+
+jobs:
+  incus-deploy:
+    uses: ./.github/workflows/_reusable.incus.deploy.yaml
+    with:
+      action: ${{ github.event.inputs.action || 'plan' }}
+      reason: ${{ github.event.inputs.reason || 'Manual triggered' }}
+      terragrunt_path: "incus/"
+      branch: ${{ inputs.branch }}
+    secrets: inherit
