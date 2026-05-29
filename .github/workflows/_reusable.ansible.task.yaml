@@ -66,6 +66,9 @@ jobs:
           ANSIBLE_HOST_PATTERN_MISMATCH: 'error'
         working-directory: DoorCEInstall
         run: |
+          # Enable strict error handling and ensure that any failure in the pipeline is properly captured
+          set -euo pipefail
+
           # Validate that inventory file exists and is not empty
           if [ ! -s "inventory.ini" ]; then
             echo "### ❌ ERROR: inventory.ini is missing or empty!" >> $GITHUB_STEP_SUMMARY
@@ -84,7 +87,8 @@ jobs:
             --inventory inventory.ini \
             --limit ${{ inputs.target_host }} \
             ${{ steps.flags.outputs.opts }} \
-            ${{ inputs.playbook }} | tee ansible_output.log
+            ${{ inputs.playbook }} \
+            | tee ansible_output.log
 
           # Generate summary for GitHub Step Summary
           echo "### 🚀 Ansible Deployment Report (${{ inputs.action }})" >> $GITHUB_STEP_SUMMARY
