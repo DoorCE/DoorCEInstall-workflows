@@ -25,6 +25,13 @@ on:
         required: false
         type: string
         default: 'main'
+    secrets:
+      TRAEFIK_KEY:
+        required: false
+      TRAEFIK_CERT:
+        required: false
+      KEYCLOAK_ADMIN_PASSWORD:
+        required: false
 jobs:
   incus-deploy:
     uses: ./.github/workflows/_reusable.incus.deploy.yaml
@@ -33,4 +40,7 @@ jobs:
       reason: ${{ github.event.inputs.reason || 'Manual triggered' }}
       terragrunt_path: "docker/"
       branch: ${{ inputs.branch }}
-    secrets: inherit
+    secrets:
+      TRAEFIK_KEY: ${{ secrets.TRAEFIK_KEY }}
+      TRAEFIK_CERT: ${{ secrets.TRAEFIK_CERT }}
+      KEYCLOAK_ADMIN_PASSWORD: ${{ secrets.KEYCLOAK_ADMIN_PASSWORD }}

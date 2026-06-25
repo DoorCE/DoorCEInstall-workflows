@@ -12,7 +12,13 @@ on:
       branch:
         type: string
         default: 'main'
-
+    secrets:
+      TRAEFIK_KEY:
+        required: false
+      TRAEFIK_CERT:
+        required: false
+      KEYCLOAK_ADMIN_PASSWORD:
+        required: false
 jobs:
   prepare:
     runs-on: self-hosted
